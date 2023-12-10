@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -16,26 +15,43 @@ type RequestPayload struct {
 
 type ResponsePayload struct {
 	SortedArrays [][]int `json:"sorted_arrays"`
-	TimeNS       int64   `json:"time_ns"`
+	TimeNS       string  `json:"time_ns"`
 }
 
-func main() {
-	http.HandleFunc("/process-single", ProcessSingle)
-	http.HandleFunc("/process-concurrent", ProcessConcurrent)
-
-	fmt.Println("Server is listening on :8000")
-	http.ListenAndServe(":8000", nil)
+func sortSequential(input [][]int) [][]int {
+	for i := range input {
+		sort.Ints(input[i])
+	}
+	return input
 }
 
-func ProcessSingle(w http.ResponseWriter, r *http.Request) {
-	handleRequest(w, r, sequentialSort)
+func sortConcurrent(input [][]int) [][]int {
+	var wg sync.WaitGroup
+	ch := make(chan []int, len(input))
+
+	for _, arr := range input {
+		wg.Add(1)
+		go func(a []int) {
+			sort.Ints(a)
+			ch <- a
+			wg.Done()
+		}(arr)
+	}
+
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	var result [][]int
+	for sortedArr := range ch {
+		result = append(result, sortedArr)
+	}
+
+	return result
 }
 
-func ProcessConcurrent(w http.ResponseWriter, r *http.Request) {
-	handleRequest(w, r, concurrentSort)
-}
-
-func handleRequest(w http.ResponseWriter, r *http.Request, sortFunc func([]int) []int) {
+func processSingleHandler(w http.ResponseWriter, r *http.Request) {
 	var reqPayload RequestPayload
 	if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
@@ -43,35 +59,52 @@ func handleRequest(w http.ResponseWriter, r *http.Request, sortFunc func([]int) 
 	}
 
 	startTime := time.Now()
-	sortedArrays := make([][]int, len(reqPayload.ToSort))
-	for i, arr := range reqPayload.ToSort {
-		sortedArrays[i] = sortFunc(arr)
-	}
-	endTime := time.Now()
+	sortedArrays := sortSequential(reqPayload.ToSort)
+	duration := time.Since(startTime)
 
 	response := ResponsePayload{
 		SortedArrays: sortedArrays,
-		TimeNS:       endTime.Sub(startTime).Nanoseconds(),
+		TimeNS:       fmt.Sprintf("%dns", duration.Nanoseconds()),
 	}
 
+	sendResponse(w, response)
+}
+
+func processConcurrentHandler(w http.ResponseWriter, r *http.Request) {
+	var reqPayload RequestPayload
+	if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	startTime := time.Now()
+	sortedArrays := sortConcurrent(reqPayload.ToSort)
+	duration := time.Since(startTime)
+
+	response := ResponsePayload{
+		SortedArrays: sortedArrays,
+		TimeNS:       fmt.Sprintf("%dns", duration.Nanoseconds()),
+	}
+
+	sendResponse(w, response)
+}
+
+func sendResponse(w http.ResponseWriter, response ResponsePayload) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	w.WriteHeader(http.StatusOK)
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
-func sequentialSort(arr []int) []int {
-	sort.Ints(arr)
-	return arr
-}
+func main() {
+	http.HandleFunc("/process-single", processSingleHandler)
+	http.HandleFunc("/process-concurrent", processConcurrentHandler)
 
-func concurrentSort(arr []int) []int {
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		sort.Ints(arr)
-	}()
-
-	wg.Wait()
-	return arr
+	fmt.Println("Server is running on port 8000")
+	if err := http.ListenAndServe(":8000", nil); err != nil {
+		fmt.Printf("Error starting server: %s\n", err)
+	}
 }
